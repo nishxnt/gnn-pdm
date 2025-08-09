@@ -2,9 +2,13 @@ __pycache__/
 *.pyc
 .venv/
 .env
-data/
-artifacts/
-mlruns/
+/data/
+/artifacts/
+/mlruns/
 .ipynb_checkpoints/
 .DS_Store
 .vscode/
+
+# allow source package (was shadowed by data/ ignore)
+!src/data/
+!src/data/**
