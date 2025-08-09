@@ -5,3 +5,5 @@ def phm_score(y, yhat):
     d = yhat - y
     s = np.where(d < 0, np.exp(-d/13) - 1, np.exp(d/10) - 1)
     return float(np.sum(s))
+def summarise_metrics(y, yhat):
+    return {"mae": mae(y,yhat), "rmse": rmse(y,yhat), "phm": phm_score(y,yhat)}
