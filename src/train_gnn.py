@@ -25,12 +25,12 @@ def eval_epoch(model, dl, ei, dev):
 
 def log_history(row, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    header = ["epoch","train_loss","mae","rmse","phm"]
+    header=["epoch","train_loss","mae","rmse","phm"]
     write_header = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
+    with open(path,"a",newline="") as f:
+        w=csv.writer(f)
         if write_header: w.writerow(header)
-        w.writerow([row[k] for k in header])
+        w.writerow([row.get(k) for k in header])
 
 def main(a):
     set_seed(a.seed); dev='cuda' if torch.cuda.is_available() else 'cpu'
@@ -40,24 +40,29 @@ def main(a):
     va_dl=DataLoader(WindowDataset(X,y,va), batch_size=a.batch, shuffle=False, num_workers=2)
     m=SAGEGRU(in_feats=1, hidden_g=a.hg, hidden_t=a.ht).to(dev)
     opt=torch.optim.AdamW(m.parameters(), lr=a.lr, weight_decay=1e-4); loss_fn=nn.L1Loss()
-    ck='artifacts/gnn'; os.makedirs(ck,exist_ok=True)
-    last=f'{ck}/last.ckpt'; best=f'{ck}/best.ckpt'
+    ck='artifacts/gnn'; os.makedirs(ck,exist_ok=True); last=f'{ck}/last.ckpt'; best=f'{ck}/best.ckpt'
     start,best_mae,_=load_if_exists(last, m, opt, None, map_location=dev)
 
     mlflow.set_tracking_uri(os.getenv('MLFLOW_TRACKING_URI','file:./mlruns'))
     mlflow.set_experiment(os.getenv('MLFLOW_EXPERIMENT_NAME','gnn-pdm-fd001'))
     with mlflow.start_run(run_name='sage_gru'):
         mlflow.log_params({'hg':a.hg,'ht':a.ht,'lr':a.lr,'batch':a.batch,'epochs':a.epochs})
+        # ---- eval-only fallback when no new epochs to run ----
+        if start >= a.epochs:
+            metrics = eval_epoch(m, va_dl, ei, dev)
+            mlflow.log_metric('train_loss', float('nan'), step=start)
+            for k in ('mae','rmse','phm'): mlflow.log_metric(k, float(metrics[k]), step=start)
+            log_history({"epoch":start,"train_loss":float('nan'), **metrics}, f"{ck}/history.csv")
+            print(f"[resume] nothing to train (start={start} >= epochs={a.epochs}). Logged eval-only metrics:", metrics)
+            print('Best val MAE:', best_mae); return
+        # ------------------------------------------------------
         for ep in range(start, a.epochs):
-            tl=train_epoch(m,tr_dl,opt,loss_fn,ei,dev)
-            metrics=eval_epoch(m,va_dl,ei,dev)
+            tl=train_epoch(m,tr_dl,opt,loss_fn,ei,dev); metrics=eval_epoch(m,va_dl,ei,dev)
             save_checkpoint(last, m, opt, None, ep, best_mae, vars(a))
-            if metrics['mae']<best_mae:
-                best_mae=metrics['mae']; save_checkpoint(best, m, opt, None, ep, best_mae, vars(a))
+            if metrics['mae']<best_mae: best_mae=metrics['mae']; save_checkpoint(best, m, opt, None, ep, best_mae, vars(a))
             mlflow.log_metric('train_loss', float(tl), step=ep)
-            for k in ('mae','rmse','phm'):
-                mlflow.log_metric(k, float(metrics[k]), step=ep)
-            log_history({"epoch":ep,"train_loss":float(tl), **{k:float(metrics[k]) for k in ('mae','rmse','phm')}}, f"{ck}/history.csv")
+            for k in ('mae','rmse','phm'): mlflow.log_metric(k, float(metrics[k]), step=ep)
+            log_history({"epoch":ep,"train_loss":float(tl), **metrics}, f"{ck}/history.csv")
             print(f"Epoch {ep:03d}  train {tl:.4f}  val {metrics}")
         print('Best val MAE:', best_mae)
 
