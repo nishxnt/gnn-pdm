@@ -11,20 +11,23 @@ from src.utils.early_stop import EarlyStopper
 def _make_outdir(base): os.makedirs(base, exist_ok=True); return base
 def _log_hist(row, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    hdr = ["epoch","train_loss","mae","rmse","phm"]
+    hdr=["epoch","train_loss","mae","rmse","phm"]
     write_header = not os.path.exists(path)
     with open(path,"a",newline="") as f:
-        w=csv.writer(f); 
+        w=csv.writer(f)
         if write_header: w.writerow(hdr)
         w.writerow([row.get(k) for k in hdr])
 
-def train_epoch(model, dl, opt, loss_fn, ei, dev, scaler, use_amp, clip=1.0):
+def train_epoch(model, dl, opt, loss_fn, edges, dev, scaler, use_amp, clip=1.0):
+    # Unpack edges always
+    edge_index, edge_weight = edges if isinstance(edges, tuple) else (edges, None)
     model.train(); total=0.0
     for x,y in dl:
-        x=x.to(dev); y=y.to(dev)
-        opt.zero_grad()
-        with autocast(enabled=use_amp):
-            loss = loss_fn(model(x, ei), y)
+        x=x.to(dev); y=y.to(dev); opt.zero_grad()
+        # AMP on CUDA; on CPU it will no-op
+        with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', enabled=use_amp):
+            pred = model(x, edge_index, edge_weight)   # <-- pass separately
+            loss = loss_fn(pred, y)
         scaler.scale(loss).backward()
         if clip: nn.utils.clip_grad_norm_(model.parameters(), clip)
         scaler.step(opt); scaler.update()
@@ -32,22 +35,23 @@ def train_epoch(model, dl, opt, loss_fn, ei, dev, scaler, use_amp, clip=1.0):
     return total/len(dl.dataset)
 
 @torch.no_grad()
-def eval_epoch(model, dl, ei, dev):
+def eval_epoch(model, dl, edges, dev):
+    edge_index, edge_weight = edges if isinstance(edges, tuple) else (edges, None)
     model.eval(); ys=[]; yh=[]
     for x,y in dl:
-        x=x.to(dev)
-        ys.append(y.numpy()); yh.append(model(x, ei).cpu().numpy())
+        x=x.to(dev); ys.append(y.numpy())
+        yh.append(model(x, edge_index, edge_weight).cpu().numpy())  # <-- pass separately
     y=np.concatenate(ys); yhat=np.concatenate(yh)
     return summarise_metrics(y,yhat)
 
 def main(a):
-    set_seed(a.seed)
-    dev='cuda' if torch.cuda.is_available() else 'cpu'
+    set_seed(a.seed); dev='cuda' if torch.cuda.is_available() else 'cpu'
     c=torch.load(a.cache,map_location='cpu', weights_only=False)
     X,y=c['X'],c['y']; tr,va=c['train_idx'],c['val_idx']
-    ei, ew = (c['edge_index'].to(dev), None)
-    # edge weights optional in cache; if missing, ignore
-    if 'edge_weight' in c: ew = c['edge_weight'].to(dev)
+    edge_index=c['edge_index'].to(dev)
+    edge_weight=c.get('edge_weight'); 
+    if edge_weight is not None: edge_weight=edge_weight.to(dev)
+    edges=(edge_index, edge_weight)
 
     tr_dl=DataLoader(WindowDataset(X,y,tr), batch_size=a.batch, shuffle=True, num_workers=2)
     va_dl=DataLoader(WindowDataset(X,y,va), batch_size=a.batch, shuffle=False, num_workers=2)
@@ -56,12 +60,11 @@ def main(a):
     opt=torch.optim.AdamW(m.parameters(), lr=a.lr, weight_decay=a.wd)
     sch=torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=3)
     loss_fn=nn.L1Loss()
-    out=_make_outdir(a.outdir)
-    last, best = f"{out}/last.ckpt", f"{out}/best.ckpt"
-    start,best_mae,_=load_if_exists(last, m, opt, None, map_location=dev)
+    out=_make_outdir(a.outdir); last,fbest=f"{out}/last.ckpt",f"{out}/best.ckpt"
     hist=f"{out}/history.csv"
+    start,best_mae,_=load_if_exists(last, m, opt, None, map_location=dev, strict=False)
     stopper=EarlyStopper(patience=a.patience, min_delta=a.min_delta)
-    scaler=GradScaler(enabled=a.amp)
+    scaler=GradScaler(enabled=a.amp and torch.cuda.is_available())
 
     mlflow.set_tracking_uri(os.getenv('MLFLOW_TRACKING_URI','file:./mlruns'))
     mlflow.set_experiment(os.getenv('MLFLOW_EXPERIMENT_NAME','gnn-pdm-fd001'))
@@ -71,7 +74,7 @@ def main(a):
                            'patience':a.patience,'min_delta':a.min_delta,'amp':a.amp,
                            'outdir':a.outdir})
         if start >= a.epochs:
-            metrics = eval_epoch(m, va_dl, (ei,ew), dev)
+            metrics = eval_epoch(m, va_dl, edges, dev)
             mlflow.log_metric('train_loss', float('nan'), step=start)
             for k in ('mae','rmse','phm'): mlflow.log_metric(k, float(metrics[k]), step=start)
             _log_hist({"epoch":start,"train_loss":float('nan'), **metrics}, hist)
@@ -79,11 +82,11 @@ def main(a):
             print('Best val MAE:', best_mae); return
 
         for ep in range(start, a.epochs):
-            tl = train_epoch(m, tr_dl, opt, loss_fn, (ei,ew), dev, scaler, a.amp, a.clip)
-            metrics = eval_epoch(m, va_dl, (ei,ew), dev)
+            tl = train_epoch(m, tr_dl, opt, loss_fn, edges, dev, scaler, a.amp, a.clip)
+            metrics = eval_epoch(m, va_dl, edges, dev)
             save_checkpoint(last, m, opt, None, ep, best_mae, vars(a))
             if metrics['mae'] < best_mae:
-                best_mae = metrics['mae']; save_checkpoint(best, m, opt, None, ep, best_mae, vars(a))
+                best_mae = metrics['mae']; save_checkpoint(fbest, m, opt, None, ep, best_mae, vars(a))
             mlflow.log_metric('train_loss', float(tl), step=ep)
             for k in ('mae','rmse','phm'): mlflow.log_metric(k, float(metrics[k]), step=ep)
             _log_hist({"epoch":ep,"train_loss":float(tl), **metrics}, hist)
