@@ -16,28 +16,39 @@ class SAGEGRU(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def _sage_stack(self, x, edge_index, edge_weight=None):
-        # x: [N, F]
+        # x: [nodes_total, F]
         for conv, ln in zip(self.sages, self.norms):
             try:
                 x = conv(x, edge_index, edge_weight)
             except TypeError:
-                x = conv(x, edge_index)           # older PyG without edge_weight in SAGEConv
+                x = conv(x, edge_index)  # older PyG
             x = torch.relu(ln(x))
             x = self.drop(x)
         return x
 
     def forward(self, x_seq, edge_index, edge_weight=None):
-        # x_seq: [B, T, N, F]  (we train with B>=1; in Colab we often have B=??)
+        """
+        x_seq: [B, T, N, F]
+        edge_index: [2, E] for one graph of N nodes (shared across batch)
+        """
         B, T, N, F = x_seq.shape
-        outs = []
+        device = x_seq.device
+
+        # Build a block-diagonal batched graph: repeat edges with offsets of N
+        # shape: [2, E*B]
+        offsets = (torch.arange(B, device=device).repeat_interleave(edge_index.size(1)) * N)
+        ei_b = edge_index.repeat(1, B) + offsets
+        ew_b = edge_weight.repeat(B) if edge_weight is not None else None
+
+        # For each time step: run GNN on [B*N, F], then mean over nodes per sample
+        H_bt = []
         for t in range(T):
-            x = x_seq[:, t].reshape(N, F)         # collapse batch for graph aggregation
-            h = self._sage_stack(x, edge_index, edge_weight)   # [N, hidden_g]
-            outs.append(h)
-        H = torch.stack(outs, dim=1)              # [N,T,hidden_g] when B==1; otherwise shape aligns
-        if B == 1: H = H.unsqueeze(0)             # [1,N,T,H] style fix → we want [1,T,N,H]
-        H = H.squeeze(0)                          # [T,hidden_g]
-        H = H.unsqueeze(0)                        # [1,T,hidden_g]
-        _, ht = self.gru(H)                       # ht: [1,1,hidden_t]
-        y = self.head(ht[-1]).squeeze(-1)         # [1]
+            xt = x_seq[:, t].reshape(B * N, F)        # [B*N, F]
+            h = self._sage_stack(xt, ei_b, ew_b)      # [B*N, hidden_g]
+            h = h.view(B, N, -1).mean(dim=1)          # [B, hidden_g]
+            H_bt.append(h)
+
+        H = torch.stack(H_bt, dim=1)                  # [B, T, hidden_g]
+        _, ht = self.gru(H)                           # ht: [1, B, hidden_t]
+        y = self.head(ht[-1]).squeeze(-1)             # [B]
         return y
