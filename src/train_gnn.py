@@ -1,6 +1,7 @@
 import argparse, os, csv, numpy as np, torch, torch.nn as nn, mlflow
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
+from contextlib import nullcontext
 from src.data.dataset import WindowDataset
 from src.utils.seed import set_seed
 from src.utils.metrics import summarise_metrics
@@ -18,15 +19,19 @@ def _log_hist(row, path):
         if write_header: w.writerow(hdr)
         w.writerow([row.get(k) for k in hdr])
 
+def amp_ctx(enabled: bool):
+    """Return a context manager for AMP that works on any pytorch build."""
+    if enabled and torch.cuda.is_available():
+        return torch.cuda.amp.autocast()  # old & new builds both accept this
+    return nullcontext()
+
 def train_epoch(model, dl, opt, loss_fn, edges, dev, scaler, use_amp, clip=1.0):
-    # Unpack edges always
     edge_index, edge_weight = edges if isinstance(edges, tuple) else (edges, None)
     model.train(); total=0.0
     for x,y in dl:
         x=x.to(dev); y=y.to(dev); opt.zero_grad()
-        # AMP on CUDA; on CPU it will no-op
-        with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', enabled=use_amp):
-            pred = model(x, edge_index, edge_weight)   # <-- pass separately
+        with amp_ctx(use_amp):
+            pred = model(x, edge_index, edge_weight)
             loss = loss_fn(pred, y)
         scaler.scale(loss).backward()
         if clip: nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -40,7 +45,7 @@ def eval_epoch(model, dl, edges, dev):
     model.eval(); ys=[]; yh=[]
     for x,y in dl:
         x=x.to(dev); ys.append(y.numpy())
-        yh.append(model(x, edge_index, edge_weight).cpu().numpy())  # <-- pass separately
+        yh.append(model(x, edge_index, edge_weight).cpu().numpy())
     y=np.concatenate(ys); yhat=np.concatenate(yh)
     return summarise_metrics(y,yhat)
 
@@ -49,7 +54,7 @@ def main(a):
     c=torch.load(a.cache,map_location='cpu', weights_only=False)
     X,y=c['X'],c['y']; tr,va=c['train_idx'],c['val_idx']
     edge_index=c['edge_index'].to(dev)
-    edge_weight=c.get('edge_weight'); 
+    edge_weight=c.get('edge_weight')
     if edge_weight is not None: edge_weight=edge_weight.to(dev)
     edges=(edge_index, edge_weight)
 
